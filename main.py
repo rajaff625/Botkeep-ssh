@@ -1,54 +1,68 @@
 import asyncio
 import asyncssh
+from contextlib import asynccontextmanager
 import fcntl
 import json
 import os
 import pty
+import re
+import shutil
 import signal
 import stat
 import struct
 import subprocess
 import termios
 import threading
+import time
 import urllib.request
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, status
 from fastapi.responses import HTMLResponse, JSONResponse
-from pyngrok import ngrok, conf
 import uvicorn
 
-app = FastAPI()
-
-# Credentials & Ngrok Token (Reads from Env Vars first, falls back to defaults)
+# ================= CONFIGURATION =================
 SSH_USER = os.getenv("SSH_USER", "root")
 SSH_PASS = os.getenv("SSH_PASS", "morning")
-NGROK_TOKEN = os.getenv(
-    "NGROK_TOKEN",
-    "3DJO7gEeVEZLoTbTAPjXI6Z2xUP_2UCYDdJ7TnuXeGdx1wrJv"
-)
-HTTP_PORT = int(os.getenv("PORT", 8000))
+HTTP_PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", 8000)))
 INTERNAL_SSH_PORT = 2222
 
-WORK_DIR = "/tmp/ubuntu22_env"
+# Paste your Reusable Tailscale Auth Key here or set TS_AUTHKEY in Botkeep Env Vars
+TS_AUTHKEY = "tskey-auth-kEgfhYXhXF11CNTRL-jxdxRgaf4jAKogGoSJC7jA4pEEur9EUa"
+
+# Store everything in persistent /home/container (avoids /tmp RAM disk full error)
+BASE_DIR = "/home/container" if os.path.exists("/home/container") else os.getcwd()
+WORK_DIR = os.path.join(BASE_DIR, ".ubuntu22")
 ROOTFS_DIR = os.path.join(WORK_DIR, "rootfs")
 PROOT_BIN = os.path.join(WORK_DIR, "proot")
 HOST_KEY_PATH = os.path.join(WORK_DIR, "ssh_host_key")
 
+TS_DIR = os.path.join(WORK_DIR, "tailscale")
+TS_STATE_DIR = os.path.join(WORK_DIR, "ts_state")
+TS_SOCK = os.path.join(WORK_DIR, "tailscaled.sock")
+
 UBUNTU_ROOTFS_URL = "https://cloud-images.ubuntu.com/minimal/releases/jammy/release/ubuntu-22.04-minimal-cloudimg-amd64-root.tar.xz"
 PROOT_URL = "https://github.com/proot-me/proot/releases/download/v5.3.0/proot-v5.3.0-x86_64-static"
+TAILSCALE_URL = "https://pkgs.tailscale.com/stable/tailscale_1.76.6_amd64.tgz"
 
 STATE = {
-    "status": "Bootstrapping Ubuntu 22.04...",
-    "ready": False,
-    "termius_host": "Waiting for ngrok...",
-    "termius_port": "Waiting...",
+    "status": "Initializing...",
+    "permanent_ip": "Waiting for Tailscale...",
+    "permanent_port": str(INTERNAL_SSH_PORT),
+    "backup_host": "Allocating backup...",
+    "backup_port": "Waiting...",
     "termius_user": SSH_USER,
-    "ssh_command": "Starting tunnel..."
 }
 
 
+def get_disk_free_mb(path):
+    try:
+        _, _, free = shutil.disk_usage(path)
+        return free // (1024 * 1024)
+    except Exception:
+        return 0
+
+
 def get_proot_cmd():
-    """Command to launch an interactive Ubuntu 22.04 bash shell as fake root."""
-    if os.path.exists(os.path.join(ROOTFS_DIR, "bin", "bash")):
+    if os.path.exists(os.path.join(ROOTFS_DIR, "bin", "bash")) and os.path.exists(PROOT_BIN):
         return [
             PROOT_BIN, "-0", "-r", ROOTFS_DIR,
             "-b", "/dev", "-b", "/proc", "-b", "/sys", "-w", "/root",
@@ -57,85 +71,145 @@ def get_proot_cmd():
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "/bin/bash", "-l"
         ]
-    # Fallback to host shell if someone connects while Ubuntu is still extracting
     return ["/bin/bash", "-i"] if os.path.exists("/bin/bash") else ["/bin/sh", "-i"]
 
 
-def start_ngrok_tcp():
-    """Starts the ngrok TCP tunnel on port 2222 and extracts Host + Port for Termius."""
+def start_permanent_tailscale():
+    """Runs Tailscale in unprivileged userspace mode for a 100% permanent IP (100.x.y.z)."""
+    os.makedirs(TS_DIR, exist_ok=True)
+    os.makedirs(TS_STATE_DIR, exist_ok=True)
+
+    tailscaled_bin = os.path.join(TS_DIR, "tailscaled")
+    tailscale_bin = os.path.join(TS_DIR, "tailscale")
+
     try:
-        os.makedirs(WORK_DIR, exist_ok=True)
-        # Store ngrok binary and config in writable /tmp directory
-        pyngrok_Conf = conf.PyngrokConfig(
-            ngrok_path=os.path.join(WORK_DIR, "ngrok"),
-            config_path=os.path.join(WORK_DIR, "ngrok.yml")
+        if not os.path.exists(tailscaled_bin):
+            STATE["status"] = "Downloading Tailscale static binaries..."
+            print("[*] Streaming Tailscale static binaries...")
+            req = urllib.request.urlopen(TAILSCALE_URL)
+            tar_proc = subprocess.Popen(
+                ["tar", "-xz", "--strip-components=1", "-C", TS_DIR],
+                stdin=subprocess.PIPE
+            )
+            shutil.copyfileobj(req, tar_proc.stdin)
+            tar_proc.stdin.close()
+            tar_proc.wait()
+            os.chmod(tailscaled_bin, 0o755)
+            os.chmod(tailscale_bin, 0o755)
+
+        # Start tailscaled in userspace-networking mode (no root or /dev/net/tun required!)
+        print("[*] Starting tailscaled in userspace networking mode...")
+        subprocess.Popen(
+            [
+                tailscaled_bin,
+                "--tun=userspace-networking",
+                f"--state={os.path.join(TS_STATE_DIR, 'tailscaled.state')}",
+                f"--socket={TS_SOCK}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
-        conf.set_default(pyngrok_Conf)
-        ngrok.set_auth_token(NGROK_TOKEN)
+        time.sleep(3)
 
-        tunnel = ngrok.connect(INTERNAL_SSH_PORT, "tcp")
-        # tunnel.public_url looks like "tcp://0.tcp.in.ngrok.io:14892"
-        clean_url = tunnel.public_url.replace("tcp://", "")
-        host, port = clean_url.split(":")
+        if not TS_AUTHKEY or "PASTE_" in TS_AUTHKEY:
+            STATE["permanent_ip"] = "Set TS_AUTHKEY to enable permanent IP"
+            print("[!] TS_AUTHKEY not set. Streaming login link to console logs instead...")
+            up_proc = subprocess.Popen(
+                [tailscale_bin, f"--socket={TS_SOCK}", "up", "--hostname=ubuntu22-botkeep"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            for line in up_proc.stdout:
+                print(f"[Tailscale] {line.strip()}")
+                if "https://login.tailscale.com" in line:
+                    STATE["permanent_ip"] = f"Approve login: {line.strip()}"
+        else:
+            subprocess.run(
+                [
+                    tailscale_bin, f"--socket={TS_SOCK}", "up",
+                    f"--authkey={TS_AUTHKEY}",
+                    "--hostname=ubuntu22-botkeep",
+                    "--reset"
+                ],
+                check=False
+            )
 
-        STATE["termius_host"] = host
-        STATE["termius_port"] = port
-        STATE["ssh_command"] = f"ssh {SSH_USER}@{host} -p {port}"
-        print(f"\n==========================================")
-        print(f"[+] NGROK TCP TUNNEL ONLINE FOR TERMIUS!")
-        print(f"    Host / IP : {host}")
-        print(f"    Port      : {port}")
-        print(f"    Username  : {SSH_USER}")
-        print(f"    Password  : {SSH_PASS}")
-        print(f"==========================================\n")
+        # Fetch the permanent 100.x.y.z IPv4 address
+        ip_out = subprocess.check_output(
+            [tailscale_bin, f"--socket={TS_SOCK}", "ip", "-4"], text=True
+        ).strip()
+
+        if ip_out:
+            STATE["permanent_ip"] = ip_out.splitlines()[0]
+            print("\n=======================================================")
+            print("[+] PERMANENT TERMIUS IP LOCKED (NEVER CHANGES!)")
+            print(f"    Permanent IP : {STATE['permanent_ip']}")
+            print(f"    Port         : {INTERNAL_SSH_PORT}")
+            print(f"    Username     : {SSH_USER}")
+            print(f"    Password     : {SSH_PASS}")
+            print("=======================================================\n")
+
     except Exception as e:
-        STATE["termius_host"] = f"Ngrok Error: {e}"
-        print(f"[!] Ngrok error: {e}")
+        STATE["permanent_ip"] = f"Tailscale Error: {e}"
+        print(f"[!] Tailscale setup error: {e}")
 
 
 def setup_ubuntu():
-    """Downloads PRoot and Ubuntu 22.04 RootFS in the background."""
+    """Streams Ubuntu 22.04 RootFS directly into /home/container/.ubuntu22."""
     os.makedirs(WORK_DIR, exist_ok=True)
+    shutil.rmtree("/tmp/ubuntu22_env", ignore_errors=True)
+    free_mb = get_disk_free_mb(WORK_DIR)
+
     try:
         if not os.path.exists(PROOT_BIN):
-            STATE["status"] = "Downloading static PRoot..."
             urllib.request.urlretrieve(PROOT_URL, PROOT_BIN)
             os.chmod(PROOT_BIN, os.stat(PROOT_BIN).st_mode | stat.S_IEXEC)
 
         if not os.path.exists(os.path.join(ROOTFS_DIR, "bin", "bash")):
-            STATE["status"] = "Downloading Ubuntu 22.04 RootFS (~85MB)..."
-            os.makedirs(ROOTFS_DIR, exist_ok=True)
-            archive = os.path.join(WORK_DIR, "rootfs.tar.xz")
-            urllib.request.urlretrieve(UBUNTU_ROOTFS_URL, archive)
+            if free_mb >= 220:
+                STATE["status"] = f"Installing Ubuntu 22.04 ({free_mb}MB free)..."
+                os.makedirs(ROOTFS_DIR, exist_ok=True)
+                req = urllib.request.urlopen(UBUNTU_ROOTFS_URL)
+                tar_proc = subprocess.Popen(
+                    ["tar", "-xJ", "-C", ROOTFS_DIR, "--exclude=dev/*"],
+                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                shutil.copyfileobj(req, tar_proc.stdin)
+                tar_proc.stdin.close()
+                tar_proc.wait()
 
-            STATE["status"] = "Extracting Ubuntu 22.04 RootFS..."
-            subprocess.run(["tar", "-xJf", archive, "-C", ROOTFS_DIR, "--exclude=dev/*"], check=False)
-            os.remove(archive)
+                resolv = os.path.join(ROOTFS_DIR, "etc", "resolv.conf")
+                if os.path.islink(resolv) or os.path.exists(resolv):
+                    os.remove(resolv)
+                with open(resolv, "w") as f:
+                    f.write("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
 
-            resolv = os.path.join(ROOTFS_DIR, "etc", "resolv.conf")
-            if os.path.islink(resolv) or os.path.exists(resolv):
-                os.remove(resolv)
-            with open(resolv, "w") as f:
-                f.write("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+                apt_conf = os.path.join(ROOTFS_DIR, "etc", "apt", "apt.conf.d")
+                os.makedirs(apt_conf, exist_ok=True)
+                with open(os.path.join(apt_conf, "99sandbox"), "w") as f:
+                    f.write('APT::Sandbox::User "root";\n')
 
-            apt_conf = os.path.join(ROOTFS_DIR, "etc", "apt", "apt.conf.d")
-            os.makedirs(apt_conf, exist_ok=True)
-            with open(os.path.join(apt_conf, "99sandbox"), "w") as f:
-                f.write('APT::Sandbox::User "root";\n')
-
-            STATE["status"] = "Installing curl, wget, unzip in Ubuntu 22.04..."
-            cmd = get_proot_cmd()[:-2] + [
-                "/bin/bash", "-c",
-                "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget unzip"
-            ]
-            subprocess.run(cmd, check=False)
-
-        STATE["ready"] = True
-        STATE["status"] = "Ubuntu 22.04 Ready"
-        print("[+] Ubuntu 22.04 RootFS is completely installed and ready!")
+        STATE["status"] = f"Ubuntu 22.04 Ready ({get_disk_free_mb(WORK_DIR)}MB Free)"
     except Exception as e:
-        STATE["status"] = f"Ubuntu Setup Error: {e}"
-        print(f"[!] Setup error: {e}")
+        STATE["status"] = f"Ready ({e})"
+
+
+async def maintain_backup_tunnel():
+    """Keeps Pinggy active as a secondary fallback in case you are on a device without Tailscale."""
+    while True:
+        try:
+            async with asyncssh.connect(
+                "a.pinggy.io", port=443, username="tcp", password="",
+                known_hosts=None, keepalive_interval=30
+            ) as conn:
+                await conn.forward_remote_port("", 0, "127.0.0.1", INTERNAL_SSH_PORT)
+                async with conn.create_process() as proc:
+                    async for line in proc.stdout:
+                        match = re.search(r"tcp://([a-zA-Z0-9.\-]+):(\d+)", line)
+                        if match:
+                            STATE["backup_host"], STATE["backup_port"] = match.group(1), match.group(2)
+                await conn.wait_closed()
+        except Exception:
+            await asyncio.sleep(10)
 
 
 def set_winsize(fd, row, col):
@@ -196,124 +270,39 @@ async def handle_ssh_client(process: asyncssh.SSHServerProcess):
         process.close()
 
 
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Termius & Ubuntu 22.04 Gateway</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: radial-gradient(circle at top left, #141629, #07080e);
-      color: #e2e8f0;
-      font-family: 'Segoe UI', system-ui, sans-serif;
-      height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .card {
-      background: rgba(255, 255, 255, 0.04);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 16px;
-      padding: 32px;
-      width: 420px;
-      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.7);
-    }
-    h2 { font-size: 1.25rem; margin-bottom: 6px; text-align: center; }
-    .status { font-size: 0.85rem; color: #a5b4fc; text-align: center; margin-bottom: 20px; }
-    input {
-      width: 100%; padding: 12px; background: rgba(0,0,0,0.4);
-      border: 1px solid rgba(255,255,255,0.15); border-radius: 8px;
-      color: #fff; margin-bottom: 14px; outline: none;
-    }
-    button {
-      width: 100%; padding: 12px; background: linear-gradient(135deg, #6366f1, #8b5cf6);
-      border: none; border-radius: 8px; color: #fff; font-weight: 600; cursor: pointer;
-    }
-    .info-row {
-      display: flex; justify-content: space-between; padding: 10px 0;
-      border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 0.9rem;
-    }
-    .val { font-family: Consolas, monospace; color: #38bdf8; user-select: all; }
-    #details { display: none; margin-top: 16px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>Ubuntu 22.04 SSH Details</h2>
-    <div class="status" id="status-text">Checking status...</div>
-    <div id="login-box">
-      <input type="password" id="pass" placeholder="Enter SSH_PASS (default: morning)" autofocus />
-      <button onclick="fetchDetails()">Show Termius Login Details</button>
-    </div>
-    <div id="details">
-      <div class="info-row"><span>Hostname / IP:</span><span class="val" id="t-host">...</span></div>
-      <div class="info-row"><span>Port:</span><span class="val" id="t-port">...</span></div>
-      <div class="info-row"><span>Username:</span><span class="val" id="t-user">...</span></div>
-      <div class="info-row"><span>CLI Command:</span><span class="val" id="t-cmd">...</span></div>
-    </div>
-  </div>
-  <script>
-    let savedPass = "";
-    async function poll() {
-      const res = await fetch('/info' + (savedPass ? `?passkey=${encodeURIComponent(savedPass)}` : ''));
-      const data = await res.json();
-      document.getElementById('status-text').innerText = data.status;
-      if (data.termius_host && data.termius_host !== "Locked") {
-        document.getElementById('login-box').style.display = 'none';
-        document.getElementById('details').style.display = 'block';
-        document.getElementById('t-host').innerText = data.termius_host;
-        document.getElementById('t-port').innerText = data.termius_port;
-        document.getElementById('t-user').innerText = data.termius_user;
-        document.getElementById('t-cmd').innerText = data.ssh_command;
-      }
-    }
-    function fetchDetails() {
-      savedPass = document.getElementById('pass').value;
-      poll();
-    }
-    setInterval(poll, 3000);
-    poll();
-  </script>
-</body>
-</html>
-"""
-
-
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     os.makedirs(WORK_DIR, exist_ok=True)
     if not os.path.exists(HOST_KEY_PATH):
         key = asyncssh.generate_private_key("ssh-ed25519")
         key.write_private_key(HOST_KEY_PATH)
 
-    # 1. Start pure-Python SSH server on local port 2222
+    # Listen on 0.0.0.0:2222 so both Tailscale (100.x.y.z:2222) and localhost tunnels can reach it
     await asyncssh.create_server(
-        UbuntuSSHServer, "127.0.0.1", INTERNAL_SSH_PORT,
+        UbuntuSSHServer, "0.0.0.0", INTERNAL_SSH_PORT,
         server_host_keys=[HOST_KEY_PATH],
         process_factory=handle_ssh_client,
         encoding="utf-8"
     )
 
-    # 2. Launch ngrok TCP tunnel and Ubuntu 22.04 bootstrapper in background threads
-    threading.Thread(target=start_ngrok_tcp, daemon=True).start()
     threading.Thread(target=setup_ubuntu, daemon=True).start()
+    threading.Thread(target=start_permanent_tailscale, daemon=True).start()
+    backup_task = asyncio.create_task(maintain_backup_tunnel())
+    yield
+    backup_task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/")
-async def home():
-    return HTMLResponse(HTML_PAGE)
-
-
-@app.get("/info")
 async def info_endpoint(passkey: str = Query("")):
     if passkey == SSH_PASS:
         return JSONResponse(STATE)
-    return JSONResponse({"status": STATE["status"], "termius_host": "Locked"})
+    return JSONResponse({
+        "status": STATE["status"],
+        "hint": "Append ?passkey=morning to URL to view your Permanent Termius IP"
+    })
 
 
 if __name__ == "__main__":
