@@ -105,7 +105,25 @@ def start_localtonet():
             return
 
         print("[+] Starting Localtonet TCP Tunnel...")
-        subprocess.run([LOCALTONET_BIN, "-t", LOCALTONET_TOKEN], check=False)
+        # Run in background and pipe input so it doesn't freeze waiting for a keyboard
+        proc = subprocess.Popen(
+            [LOCALTONET_BIN, "-t", LOCALTONET_TOKEN],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        
+        # Auto-send an "Enter" keystroke in case it prompts to select a tunnel
+        try:
+            proc.stdin.write("\n")
+            proc.stdin.flush()
+        except:
+            pass
+
+        for line in proc.stdout:
+            print(f"[Localtonet] {line.strip()}")
+            
     except Exception as e:
         print(f"[!] Localtonet error: {e}")
 
